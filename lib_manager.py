@@ -10,6 +10,8 @@ Features:
 - Zip File Processing: Automatically extracts and processes KiCad components
 - Interactive Library Selection: User-friendly menu for selecting target library
 - File Type Detection: Automatically categorizes symbols, footprints, and 3D models
+- Duplicate Detection: Warns if a symbol already exists in the library
+- 3D Model Path Fixing: Automatically updates footprint 3D model references
 - Project Integration: Optional integration with project-specific library settings
 - Git Integration: Automated commit and push functionality
 
@@ -17,9 +19,9 @@ Usage:
     python lib_manager.py <zip_file> [options]
 
 Options:
+    --library <name>    Target library (skip interactive menu)
     --add-to-project    Add libraries to project-specific settings
     --init-libraries    Initialize empty library files
-    --migrate           Migrate symbols from existing files to categorized libraries
     --commit            Commit changes with automated message
     --push              Push changes to remote repository
     --help              Show this help message
@@ -34,8 +36,9 @@ import zipfile
 import shutil
 import argparse
 import subprocess
+import re
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 import tempfile
 
 
@@ -213,14 +216,61 @@ class LibraryManager:
         
         return categorized
     
+    def get_existing_symbols(self, library_key: str) -> Set[str]:
+        """Get set of symbol names that already exist in a library"""
+        existing_symbols = set()
+        target_sym_file = self.lib_sym_path / self.libraries[library_key]['sym_file']
+        
+        if target_sym_file.exists():
+            try:
+                with open(target_sym_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                # Find all symbol names using regex
+                matches = re.findall(r'\(symbol "([^"]+)"', content)
+                # Filter out sub-symbols (contain underscore followed by number at end)
+                for match in matches:
+                    if not re.match(r'.+_\d+_\d+$', match):
+                        existing_symbols.add(match)
+            except Exception:
+                pass
+        
+        return existing_symbols
+    
+    def extract_symbol_names(self, symbol_content: str) -> List[str]:
+        """Extract symbol names from symbol file content"""
+        names = []
+        matches = re.findall(r'\(symbol "([^"]+)"', symbol_content)
+        for match in matches:
+            # Skip sub-symbols (e.g., "PartName_1_1")
+            if not re.match(r'.+_\d+_\d+$', match):
+                names.append(match)
+        return names
+    
     def add_symbol_to_library(self, symbol_file: Path, library_key: str) -> bool:
-        """Add symbol to the specified library"""
+        """Add symbol to the specified library with duplicate detection"""
         try:
             target_sym_file = self.lib_sym_path / self.libraries[library_key]['sym_file']
             
             # Read the symbol file content
             with open(symbol_file, 'r', encoding='utf-8') as f:
                 symbol_content = f.read().strip()
+            
+            # Check for duplicates
+            existing_symbols = self.get_existing_symbols(library_key)
+            new_symbol_names = self.extract_symbol_names(symbol_content)
+            
+            duplicates = [name for name in new_symbol_names if name in existing_symbols]
+            if duplicates:
+                print(f"⚠ Symbol(s) already exist in {library_key}: {', '.join(duplicates)}")
+                while True:
+                    choice = input("  Overwrite? (y/n): ").strip().lower()
+                    if choice in ['n', 'no']:
+                        print(f"  - Skipped {symbol_file.name}")
+                        return True
+                    elif choice in ['y', 'yes']:
+                        break
+                    else:
+                        print("  Please enter 'y' or 'n'")
             
             # Extract symbols
             symbols_to_add = ""
@@ -267,6 +317,36 @@ class LibraryManager:
             print(f"✗ Error adding symbol {symbol_file.name}: {e}")
             return False
     
+    def update_footprint_3d_path(self, footprint_file: Path) -> None:
+        """Update 3D model path in footprint to use library's 3d_models folder"""
+        try:
+            with open(footprint_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Find and update 3D model paths
+            # Pattern: (model "path/to/model.step"
+            def replace_model_path(match):
+                original_path = match.group(1)
+                model_name = Path(original_path).name
+                # Use ${KIPRJMOD}/lib/3d_models/ or relative path
+                new_path = f"${{KICAD_3DMODEL_DIR}}/{model_name}"
+                return f'(model "{new_path}"'
+            
+            updated_content = re.sub(
+                r'\(model "([^"]+)"',
+                replace_model_path,
+                content
+            )
+            
+            if updated_content != content:
+                with open(footprint_file, 'w', encoding='utf-8') as f:
+                    f.write(updated_content)
+                print(f"  → Updated 3D model path in {footprint_file.name}")
+                
+        except Exception as e:
+            # Non-fatal error, just skip
+            pass
+    
     def add_footprint_to_library(self, footprint_file: Path, library_key: str) -> bool:
         """Add footprint to the specified library"""
         try:
@@ -274,7 +354,24 @@ class LibraryManager:
             target_fp_dir.mkdir(parents=True, exist_ok=True)
             
             target_file = target_fp_dir / footprint_file.name
+            
+            # Check for duplicate
+            if target_file.exists():
+                print(f"⚠ Footprint already exists: {footprint_file.name}")
+                while True:
+                    choice = input("  Overwrite? (y/n): ").strip().lower()
+                    if choice in ['n', 'no']:
+                        print(f"  - Skipped {footprint_file.name}")
+                        return True
+                    elif choice in ['y', 'yes']:
+                        break
+                    else:
+                        print("  Please enter 'y' or 'n'")
+            
             shutil.copy2(footprint_file, target_file)
+            
+            # Update 3D model path in the copied footprint
+            self.update_footprint_3d_path(target_file)
             
             print(f"✓ Added footprint {footprint_file.name} to {library_key}")
             return True
@@ -632,7 +729,8 @@ class LibraryManager:
         return info
     
     def process_zip_file(self, zip_path: str, add_to_project: bool = False, 
-                         commit: bool = False, push: bool = False) -> bool:
+                         commit: bool = False, push: bool = False,
+                         library: str = None) -> bool:
         """Main method to process a zip file"""
         print(f"\nProcessing: {zip_path}")
         
@@ -652,13 +750,21 @@ class LibraryManager:
                 print("\n⚠ No KiCad files found in zip")
                 return False
             
-            # Display library menu and get selection
-            self.display_library_menu()
-            selected_library = self.get_library_selection()
-            
-            if selected_library is None:
-                print("No library selected. Operation cancelled.")
-                return False
+            # Get library selection (from CLI or interactively)
+            if library:
+                if library not in self.libraries:
+                    print(f"Error: Unknown library '{library}'")
+                    print(f"Valid libraries: {', '.join(self.libraries.keys())}")
+                    return False
+                selected_library = library
+                print(f"\nUsing library: {selected_library}")
+            else:
+                self.display_library_menu()
+                selected_library = self.get_library_selection()
+                
+                if selected_library is None:
+                    print("No library selected. Operation cancelled.")
+                    return False
             
             print(f"\nAdding to library: {selected_library}")
             
@@ -719,6 +825,12 @@ Library Categories:
     )
     
     parser.add_argument('zip_file', nargs='?', help='Path to component zip file')
+    parser.add_argument('--library', '-l', type=str,
+                        choices=['connectors', 'passives', 'discretes', 'ics', 'power',
+                                'microcontrollers', 'memory', 'rf', 'sensors', 
+                                'optoelectronics', 'electromechanical', 'protection',
+                                'audio', 'crystals_oscillators', 'mechanical'],
+                        help='Target library (skip interactive menu)')
     parser.add_argument('--add-to-project', action='store_true', 
                         help='Add libraries to project-specific settings')
     parser.add_argument('--init-libraries', action='store_true',
@@ -756,7 +868,8 @@ Library Categories:
             args.zip_file,
             add_to_project=args.add_to_project,
             commit=args.commit,
-            push=args.push
+            push=args.push,
+            library=args.library
         )
     else:
         parser.print_help()
